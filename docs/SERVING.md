@@ -167,7 +167,6 @@ All collection happens on a scrape: no per-request hooks, GPU reads or CUDA sync
 lock is busy, the endpoint reuses its last snapshot. `basal_state_cache_snapshot_timestamp_seconds` reports its Unix
 timestamp; 0 means no snapshot yet, and cache values are omitted until one succeeds. Scraping still uses CPU and the
 server's event loop; measure its impact on your workload. The endpoint has the same network access as the HTTP API.
-For a native Windows before/after test, see [the metrics benchmark](benchmarks/METRICS.md).
 
 ## Inference on a JSONL file
 
