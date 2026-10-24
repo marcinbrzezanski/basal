@@ -123,6 +123,8 @@ def test_health_counts_running_and_queued_requests():
         second = asyncio.get_running_loop().create_task(c.post("/v1/systemone", json=BODY))
         await until(lambda: srv.in_flight == 2)
         health.append((await c.get("/health")).json())
+        metrics = await c.get("/metrics")
+        assert "basal_requests_running 1\n" in metrics.text and "basal_requests_queued 1\n" in metrics.text
         engine.go.set()
         codes = [(await t).status_code for t in (first, second)]
         health.append((await c.get("/health")).json())
