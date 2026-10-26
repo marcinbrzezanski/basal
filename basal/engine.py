@@ -805,38 +805,43 @@ class StateCache:
             out.append(h)
         return out
 
-    def longest(self, tokens):
-        """The cached state sharing the longest prefix with tokens -> (its key, its keys / values, the length of the
-        common prefix, its length), or None (no common full block). Found by the longest common block, then extended
-        token by token: a state that extends a cached one shares all of it, an edited one up to the edit."""
+    def longest(self, tokens, usable=None):
+        """The longest cached prefix -> (key, KV, matched length, state length), or None.
+        usable(KV, matched length, state length) may reject a match whose KV cannot continue it."""
         t = np.asarray(tokens, dtype=np.int64)
         blocks = self._blocks(t)
+        rejected = set() if usable is not None else ()
         with self.lock:
             for i in range(len(blocks) - 1, -1, -1):
                 keys = self.index.get(blocks[i])
-                if keys is not None:
-                    break
-            else:
-                return None
-            start = (i + 1) * self.BLOCK
-            # A matching next full block would have selected a deeper bucket.
-            stop, limit = min(len(t), start + self.BLOCK), min(len(t), start + self.BLOCK - 1)
-            best, matched = None, start - 1
-            # shortcut: scan this bucket only; consider a trie if large buckets dominate measured lookup time.
-            for key in keys if isinstance(keys, dict) else (keys,):
-                kv, _, own, _ = self.entries[key]
-                n = min(len(own), stop)
-                if n <= matched or (matched >= start and own[matched] != t[matched]):
+                if keys is None:
                     continue
-                diff = np.nonzero(own[start:n] != t[start:n])[0]
-                m = start + int(diff[0]) if len(diff) else n
-                if m > matched:
-                    best, matched = (key, kv, m, len(own)), m
-                    if m == limit:
-                        break
-            self.entries.move_to_end(best[0])
-            self.prefix_hits += 1
-            return best
+                start = (i + 1) * self.BLOCK
+                # Deeper matching candidates have already been rejected, so only the next block can match.
+                stop, limit = min(len(t), start + self.BLOCK), min(len(t), start + self.BLOCK - 1)
+                best, matched = None, start - 1
+                # shortcut: scan this bucket only; consider a trie if large buckets dominate measured lookup time.
+                for key in keys if isinstance(keys, dict) else (keys,):
+                    if key in rejected:
+                        continue
+                    kv, _, own, _ = self.entries[key]
+                    n = min(len(own), stop)
+                    if n <= matched or (matched >= start and own[matched] != t[matched]):
+                        continue
+                    diff = np.nonzero(own[start:n] != t[start:n])[0]
+                    m = start + int(diff[0]) if len(diff) else n
+                    if m > matched:
+                        if usable is not None and not usable(kv, m, len(own)):
+                            rejected.add(key)
+                            continue
+                        best, matched = (key, kv, m, len(own)), m
+                        if m == limit:
+                            break
+                if best is not None:
+                    self.entries.move_to_end(best[0])
+                    self.prefix_hits += 1
+                    return best
+            return None
 
     def _drop(self, key):
         """Removes an entry and its blocks from the index (lock held)."""
@@ -1564,14 +1569,13 @@ class GraphBackend(EagerBackend):
                 continue
             pk = units[k][0]
             root = list(pk[0][: pk[2].index(1)])
-            found = self.state_cache.longest(root)
+            found = self.state_cache.longest(root, self._usable if self.gemma is not None else None)
             if found is None:
                 continue
             old, kv, m, n = found
             if old == key:  # cached by an earlier unit of this call
                 hits[k] = kv
                 continue
-            m = self._usable(kv, m, n)
             if m < self.state_cache.BLOCK or m >= len(root):
                 continue
             prefix = []

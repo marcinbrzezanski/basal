@@ -266,3 +266,37 @@ def test_prefix_index_matches_full_scan_after_updates():
         for i in range(5):
             cache.put(cache.key([-i - 1]), kv)  # evict all indexed states with entries without token ids
         assert not cache.index
+
+
+def test_gemma_cache_chooses_a_usable_prefix(monkeypatch):
+    from tests.test_gemma4_graph import Stub as GemmaStub, tiny as gemma_tiny, separate as gemma_separate
+
+    be = GemmaStub(gemma_tiny("e4b", torch.float32))
+    query = [1] + [3 + i % 40 for i in range(599)]
+    short = query[:299]
+    short_kv, _ = be._continue(short)
+    groups = [([query + [10, 11]], [[7, 8]], len(query))]
+    reference = gemma_separate(be.model, groups[0][0], groups[0][1])[0]
+    forward, calls = be._continue, []
+
+    def observed(tokens, prefix=None, m=0):
+        calls.append(m)
+        return forward(tokens, prefix, m)
+
+    monkeypatch.setattr(be, "_continue", observed)
+    for raw_match in (300, 550):  # same bucket, then an unusable match in a deeper bucket
+        long = query[:raw_match] + [61] + [62] * 299
+        long_kv, _ = forward(long)
+        cache = be.state_cache = StateCache(1 << 24)
+        cache.put(cache.key(long), long_kv, tokens=long)
+        cache.put(cache.key(short), short_kv, tokens=short)
+        assert cache.longest(query)[2] == raw_match
+        assert be._usable(long_kv, raw_match, len(long)) == 0
+        before = cache.stats()["prefix_hits"]
+        lru = list(cache.entries)
+        assert cache.longest(query, lambda *_: False) is None
+        assert cache.stats()["prefix_hits"] == before and list(cache.entries) == lru
+        calls.clear()
+        got = torch.tensor(be.run_shared(groups)[0][0])
+        assert calls == [len(short)]
+        assert torch.allclose(got, reference, atol=1e-6)
