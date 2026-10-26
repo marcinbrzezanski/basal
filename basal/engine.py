@@ -792,7 +792,7 @@ class StateCache:
         from collections import OrderedDict
         self.budget, self.used, self.salt = int(budget_bytes), 0, salt
         self.entries, self.lock = OrderedDict(), threading.Lock()
-        self.index = {}  # chained hash of a state's first i blocks -> the key of an entry beginning with them
+        self.index = {}  # chained block hash -> one key, or insertion-ordered keys sharing this prefix
         self.hits = self.misses = self.evictions = self.prefix_hits = 0
 
     def _blocks(self, tokens):
@@ -809,31 +809,47 @@ class StateCache:
         """The cached state sharing the longest prefix with tokens -> (its key, its keys / values, the length of the
         common prefix, its length), or None (no common full block). Found by the longest common block, then extended
         token by token: a state that extends a cached one shares all of it, an edited one up to the edit."""
-        blocks = self._blocks(tokens)
+        t = np.asarray(tokens, dtype=np.int64)
+        blocks = self._blocks(t)
         with self.lock:
             for i in range(len(blocks) - 1, -1, -1):
-                key = self.index.get(blocks[i])
-                if key in self.entries and self.entries[key][2] is not None:
+                keys = self.index.get(blocks[i])
+                if keys is not None:
                     break
             else:
                 return None
-            kv, _, own = self.entries[key]
-            t, n = np.asarray(tokens, dtype=np.int64), min(len(own), len(tokens))
-            m = (i + 1) * self.BLOCK
-            diff = np.nonzero(own[m:n] != t[m:n])[0]
-            m = m + int(diff[0]) if len(diff) else n
-            self.entries.move_to_end(key)
+            start = (i + 1) * self.BLOCK
+            # A matching next full block would have selected a deeper bucket.
+            stop, limit = min(len(t), start + self.BLOCK), min(len(t), start + self.BLOCK - 1)
+            best, matched = None, start - 1
+            # shortcut: scan this bucket only; consider a trie if large buckets dominate measured lookup time.
+            for key in keys if isinstance(keys, dict) else (keys,):
+                kv, _, own, _ = self.entries[key]
+                n = min(len(own), stop)
+                if n <= matched or (matched >= start and own[matched] != t[matched]):
+                    continue
+                diff = np.nonzero(own[start:n] != t[start:n])[0]
+                m = start + int(diff[0]) if len(diff) else n
+                if m > matched:
+                    best, matched = (key, kv, m, len(own)), m
+                    if m == limit:
+                        break
+            self.entries.move_to_end(best[0])
             self.prefix_hits += 1
-            return key, kv, m, len(own)
+            return best
 
     def _drop(self, key):
         """Removes an entry and its blocks from the index (lock held)."""
-        _, size, own = self.entries.pop(key)
+        _, size, _, blocks = self.entries.pop(key)
         self.used -= size
-        if own is not None:
-            for h in self._blocks(own):
-                if self.index.get(h) == key:
-                    del self.index[h]
+        for h in blocks:
+            keys = self.index[h]
+            if isinstance(keys, dict):
+                del keys[key]
+                if len(keys) == 1:
+                    self.index[h] = next(iter(keys))
+            else:
+                del self.index[h]
 
     def key(self, tokens):
         import hashlib
@@ -866,11 +882,17 @@ class StateCache:
             if key in self.entries:
                 return
             own = None if tokens is None else np.asarray(tokens, dtype=np.int64)
-            self.entries[key] = (kv, size, own)
+            blocks = () if own is None else self._blocks(own)
+            self.entries[key] = (kv, size, own, blocks)
             self.used += size
-            if own is not None:
-                for h in self._blocks(own):
+            for h in blocks:
+                keys = self.index.get(h)
+                if keys is None:
                     self.index[h] = key
+                elif isinstance(keys, dict):
+                    keys[key] = None
+                else:
+                    self.index[h] = {keys: None, key: None}
             while self.used > self.budget:
                 self._drop(next(iter(self.entries)))
                 self.evictions += 1
