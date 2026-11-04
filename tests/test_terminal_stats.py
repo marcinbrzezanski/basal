@@ -101,14 +101,42 @@ def test_http_collects_real_usage_and_failures_without_touching_response():
                 one = await c.post("/v1/systemone", json=BODY)
                 bad = await c.post("/v1/systemone", content=b"{not json")
                 other = await c.get("/health")
-                return one, bad, other
+                decisions = await c.post("/v1/decisions", json={
+                    "input": "Invoice 1240 PLN.",
+                    "questions": [{"type": "predicate", "name": "paid", "instructions": "Paid?"}],
+                })
+                return one, bad, other, decisions
         finally:
             worker.cancel()
 
-    one, bad, other = asyncio.run(go())
+    one, bad, other, decisions = asyncio.run(go())
     assert one.status_code == 200 and one.json()["answers"]["q"]["choice"] in ("a", "b")
     assert bad.status_code == 422 and bad.json()["code"] == "INVALID_REQUEST"
-    assert other.status_code == 200
-    assert stats.requests == 2 and stats.errors == 1
-    assert stats.decisions == one.json()["usage"]["questions"] == 1
-    assert len(stats.latencies) == 2
+    assert other.status_code == 200 and decisions.status_code == 200
+    assert stats.requests == 3 and stats.errors == 1
+    assert stats.decisions == 2  # one System One question and one Decisions API question
+    assert one.json()["usage"]["questions"] == 1
+    assert len(stats.latencies) == 3
+
+
+def test_stats_and_browser_ui_can_be_enabled_together():
+    from basal.ui import UI
+
+    server = AppServer(Engine())
+    args = parser().parse_args(["--ui", "on"])
+    ui = UI(server, args, "fast")
+    stats = TerminalStats(server)
+    app = http_app(server, "fast", ui=ui, stats=stats)
+
+    async def go():
+        worker = asyncio.create_task(server.worker())
+        try:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://basal") as c:
+                return await c.post("/v1/systemone", json=BODY)
+        finally:
+            worker.cancel()
+
+    response = asyncio.run(go())
+    assert response.status_code == 200
+    assert stats.requests == 1 and stats.decisions == 1
+    assert len(ui.ring) == 1  # the UI gets the same request, without double-counting
