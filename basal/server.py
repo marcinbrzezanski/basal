@@ -2346,6 +2346,9 @@ def parser():
                     help="also serve MCP (streamable HTTP) at /mcp for agents: tools decide and decide_many over the "
                          "same queue (needs basal[mcp]; without --api-keys no authentication, like the HTTP API: bind "
                          "--host 127.0.0.1 for agents on this machine; with --api-keys /mcp needs a key too)")
+    ap.add_argument("--stats-interval", type=float, default=10.0, metavar="SECONDS",
+                    help="vLLM-style terminal throughput, latency, queue, cache and optional GPU stats every N seconds "
+                         "(default 10; 0: off; no request text is logged)")
     ap.add_argument("--ui", choices=["off", "on", "full"], default="off",
                     help="also serve a live page of this server at /ui: status, traffic since start, state cache, GPU "
                          "and host telemetry, configuration and the recent requests (their metadata, never their "
@@ -2425,7 +2428,7 @@ def error_body(e, error_format="basal"):
     return body, status
 
 
-def http_app(srv, mode, mcp=None, error_format="basal", ui=None):
+def http_app(srv, mode, mcp=None, error_format="basal", ui=None, stats=None):
     """The app of basal-serve: POST /v1/systemone and /v1/basal, POST /v1/decisions (OpenAI's Decisions API), GET
     /v1/models, /health and /metrics; mcp: (routes,
     lifespan) of --mcp on. A failed request answers error_body with http_status: 422 invalid request, 503 out of GPU memory, 500
@@ -2455,7 +2458,10 @@ def http_app(srv, mode, mcp=None, error_format="basal", ui=None):
         t = time.perf_counter()
         counts["requests"] += 1
         try:
-            return JSONResponse(await srv.serve(body))
+            result = await srv.serve(body)
+            if stats is not None:
+                request.state.basal_questions = result.get("usage", {}).get("questions", 0)
+            return JSONResponse(result)
         except Exception as e:  # noqa: BLE001
             counts["failed"] += 1
             return failed(e)
@@ -2473,7 +2479,10 @@ def http_app(srv, mode, mcp=None, error_format="basal", ui=None):
             except ValueError as e:  # not JSON (or not UTF-8)
                 raise RequestError(f"the request body is not valid JSON: {e}") from None
             s1, specs = dec.to_systemone(body)
-            return JSONResponse(dec.to_decision(await srv.serve(s1), specs))
+            result = await srv.serve(s1)
+            if stats is not None:
+                request.state.basal_questions = result.get("usage", {}).get("questions", 0)
+            return JSONResponse(dec.to_decision(result, specs))
         except Exception as e:  # noqa: BLE001
             counts["failed"] += 1
             print(f"basal: request failed: {type(e).__name__}: {str(e)[:300]}", file=sys.stderr, flush=True)
@@ -2546,6 +2555,8 @@ def http_app(srv, mode, mcp=None, error_format="basal", ui=None):
         tasks = [asyncio.get_running_loop().create_task(srv.worker())]
         if srv.long_tokens is not None:
             tasks.append(asyncio.get_running_loop().create_task(srv.long_worker()))
+        if stats is not None:
+            tasks.append(asyncio.get_running_loop().create_task(stats.run()))
         async with mcp_run() if mcp_run else nullcontext():
             yield
         for task in tasks:
@@ -2554,11 +2565,16 @@ def http_app(srv, mode, mcp=None, error_format="basal", ui=None):
     routes = [Route("/v1/systemone", systemone, methods=["POST"]), Route("/v1/basal", systemone, methods=["POST"]),
               Route("/v1/decisions", decisions, methods=["POST"]), Route("/v1/models", models),
               Route("/health", health), Route("/metrics", metrics), *mcp_routes]
+    if stats is not None:
+        routes = [Route(r.path, stats.wrap(r.endpoint), methods=sorted(r.methods))
+                  if r.path in ("/v1/systemone", "/v1/basal", "/v1/decisions") else r for r in routes]
     return Starlette(routes=ui.routes(routes, counts) if ui is not None else routes, lifespan=lifespan)
 
 
 def main():
     a = parser().parse_args()
+    if not math.isfinite(a.stats_interval) or a.stats_interval < 0:
+        raise SystemExit("--stats-interval must be a finite number >= 0 (0 disables)")
     refuse_lean_flex(a.lean, a.tree)  # before default_mode, which resolves the model on CUDA GPUs without FA3
     a.mode = a.mode or default_mode(a.model, a.revision)
     validate_quant(a.mode, a.quant)
@@ -2611,9 +2627,13 @@ def main():
         print(f"basal: web UI at http://{a.host}:{a.port}/ui" + (" (/ui/state needs an API key)" if a.api_keys else
               " (open to whoever reaches this port; --api-keys to require a key)")
               + ("; --ui full keeps the last 200 requests' text in memory for it" if a.ui == "full" else ""), flush=True)
+    stats = None
+    if a.stats_interval:
+        from .terminal_stats import TerminalStats
+        stats = TerminalStats(srv, a.stats_interval)
     from .auth import ApiKeys, protect, request_ids
     origins = [origin.strip() for origin in a.cors_origins.split(",") if origin.strip()]
-    app = protect(http_app(srv, a.mode, mcp, a.error_format, ui), ApiKeys(a.api_keys) if a.api_keys else None, origins)
+    app = protect(http_app(srv, a.mode, mcp, a.error_format, ui, stats), ApiKeys(a.api_keys) if a.api_keys else None, origins)
     app = request_ids(ui.page(app) if ui is not None else app)
     try:  # uvloop + httptools when available (uvicorn[standard]); plain asyncio otherwise
         import httptools  # noqa: F401
