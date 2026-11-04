@@ -431,6 +431,33 @@ readiness, requests in flight, requests routed by state and by load, failures; w
 replica and escalated (with several levels also per level); with `--blend`, blended answers by the number of models;
 with `--fallback`, LLM calls by result; with `--route`, requests by script.
 
+## Terminal throughput logs (fork experiment)
+
+`basal-serve` prints one vLLM-style statistics line every 10 seconds **while serving requests**. The line reports
+completed HTTP requests and decisions per second, the p50/p95 HTTP response time, running/queued requests, errors,
+the exact state-cache hit rate over the interval, and GPU utilisation/VRAM when `nvidia-ml-py` is installed.
+An idle server is quiet; log output contains no prompt, answer or request body.
+
+```bash
+basal-serve --model Remek/basal-2.0-mini --mode fast
+basal-serve --model Remek/basal-2.0-mini --mode fast --stats-interval 30  # every 30 s
+basal-serve --model Remek/basal-2.0-mini --mode fast --stats-interval 0   # disable
+```
+
+Example (numbers are illustrative):
+
+```text
+basal.stats: 18.2 req/s | 42.5 decisions/s | p50=24.0ms p95=83.0ms | running=4 waiting=2 | errors=0 | cache_hit=78% | GPU0=94% VRAM=12.4/16.0GiB
+```
+
+Rates and latency percentiles cover **completed HTTP decision requests in the latest interval** (including failed
+requests in the latency sample). `decisions/s` sums `usage.questions` from successful responses; it is not LLM
+generated-token throughput. Cache hit rate counts exact state-cache lookups (hits / (hits + misses)); cache counters
+are sampled without acquiring the lock and may be missing during GPU work. The GPU sample uses NVML in a worker
+thread, never `torch.cuda`, and is omitted if unavailable. The stats handler adds only a timestamp and an append
+per completed request; aggregation and telemetry run outside the request path. No stats are collected when the
+interval is zero. `/metrics` and `--ui on` continue to work independently.
+
 ## Live web page (2.5)
 
 `basal-serve --ui on` (off by default) also serves a live page of the server at `/ui`, opened in a browser:
